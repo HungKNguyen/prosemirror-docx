@@ -328,9 +328,9 @@ export class DocxSerializerState {
   table(
     node: Node,
     opts: {
-      getCellOptions?: (cell: Node) => ITableCellOptions;
-      getRowOptions?: (row: Node) => Omit<ITableRowOptions, "children">;
-      tableOptions?: Omit<ITableOptions, "rows">;
+      getCellOptions?: (cell: Node) => Partial<ITableCellOptions>;
+      getRowOptions?: (row: Node) => Partial<Omit<ITableRowOptions, "children">>;
+      tableOptions?: Partial<Omit<ITableOptions, "rows">>;
     } = {},
   ) {
     const prevMaxImageWidth = this.maxImageWidth;
