@@ -50,7 +50,7 @@ export const defaultNodes: NodeSerializer = {
   // Presentational
   image(state, node) {
     const { src } = node.attrs;
-    state.image(src);
+    state.image(src, 300, 300);
     state.closeBlock(node);
   },
   // Technical

@@ -1,4 +1,5 @@
 import { Node, Mark } from 'prosemirror-model';
+import { mathJaxReady, convertLatex2Math } from "@hungknguyen/docx-math-converter";
 import {
   IParagraphOptions,
   IRunOptions,
@@ -6,8 +7,6 @@ import {
   TextRun,
   ExternalHyperlink,
   ParagraphChild,
-  MathRun,
-  Math,
   TabStopType,
   TabStopPosition,
   SequentialIdentifier,
@@ -25,10 +24,11 @@ import {
   ITableOptions,
   ITableRowOptions,
 } from 'docx';
-import sizeOf from 'buffer-image-size';
 import { createNumbering, NumberingStyles } from './numbering';
 import { createDocFromState, createShortId } from './utils';
 import { IFootnotes, INumbering, Mutable } from './types';
+
+await mathJaxReady();
 
 // This is duplicated from @curvenote/schema
 export type AlignOptions = 'left' | 'center' | 'right';
@@ -44,7 +44,7 @@ export type MarkSerializer = Record<
 >;
 
 export type Options = {
-  getImageBuffer: (src: string) => Buffer;
+  cite_mode: "in-text" | "note";
 };
 
 export type IMathOpts = {
@@ -93,12 +93,24 @@ export class DocxSerializerState {
 
   currentNumbering?: { reference: string; level: number };
 
+  persistRunOpts?: IRunOptions;
+
+  persistParagraphOpts?: IParagraphOptions;
+
   constructor(nodes: NodeSerializer, marks: MarkSerializer, options: Options) {
     this.nodes = nodes;
     this.marks = marks;
     this.options = options ?? {};
     this.children = [];
     this.numbering = [];
+  }
+
+  addPersistRunOptions(opts: Partial<IRunOptions>) {
+    this.persistRunOpts = { ...this.persistRunOpts, ...opts };
+  }
+
+  addPersistParagraphOptions(opts: Partial<IParagraphOptions>) {
+    this.persistParagraphOpts = { ...this.persistParagraphOpts, ...opts };
   }
 
   renderContent(parent: Node, opts?: IParagraphOptions) {
@@ -109,10 +121,18 @@ export class DocxSerializerState {
   }
 
   render(node: Node, parent: Node, index: number) {
-    if (typeof parent === 'number') throw new Error('!');
-    if (!this.nodes[node.type.name])
-      throw new Error(`Token type \`${node.type.name}\` not supported by Word renderer`);
-    this.nodes[node.type.name](this, node, parent, index);
+    if (this.nodes[node.type.name]) {
+      this.nodes[node.type.name](this, node, parent, index);
+    } else {
+      if (!node.type.isLeaf) {
+        if (node.type.inlineContent) {
+          this.renderInline(node);
+        } else {
+          this.renderContent(node);
+        }
+        if (node.isBlock) this.closeBlock(node);
+      }
+    }
   }
 
   renderMarks(node: Node, marks: Mark[]): IRunOptions {
@@ -211,21 +231,27 @@ export class DocxSerializerState {
 
   text(text: string | null | undefined, opts?: IRunOptions) {
     if (!text) return;
-    this.current.push(new TextRun({ text, ...this.nextRunOpts, ...opts }));
+    this.current.push(
+      new TextRun({
+        text,
+        ...this.persistRunOpts,
+        ...this.nextRunOpts,
+        ...opts,
+      }),
+    );
     delete this.nextRunOpts;
   }
 
   math(latex: string, opts: IMathOpts = { inline: true }) {
+    const mathObj = convertLatex2Math(latex);
     if (opts.inline || !opts.numbered) {
-      this.current.push(new Math({ children: [new MathRun(latex)] }));
+      this.current.push(mathObj);
       return;
     }
     const id = opts.id ?? createShortId();
     this.current = [
       new TextRun('\t'),
-      new Math({
-        children: [new MathRun(latex)],
-      }),
+      mathObj,
       new TextRun('\t('),
       createReferenceBookmark(id, 'Equation'),
       new TextRun(')'),
@@ -249,39 +275,53 @@ export class DocxSerializerState {
 
   image(
     src: string,
-    widthPercent = 70,
-    align: AlignOptions = 'center',
+    width: number,
+    height: number,
+    align: AlignOptions = "center",
+    alt?: string,
+    title?: string,
+    caption?: string,
     imageRunOpts?: IImageOptions,
   ) {
-    const buffer = this.options.getImageBuffer(src);
-    const dimensions = sizeOf(buffer);
-    const aspect = dimensions.height / dimensions.width;
-    const width = this.maxImageWidth * (widthPercent / 100);
-    this.current.push(
-      new ImageRun({
-        ...imageRunOpts,
-        data: buffer,
-        transformation: {
-          ...(imageRunOpts?.transformation || {}),
-          width,
-          height: width * aspect,
-        },
-      }),
-    );
-    let alignment: string;
+    const aspect = height / width;
+    const boundedWidth = Math.min(this.maxImageWidth, width);
+    const boundedHeight = boundedWidth * aspect;
+    const match = src.match(/data:image\/([a-zA-Z]+);base64,/);
+    if (match && match[1]) {
+      const type = match[1] === "jpeg" ? "jpg" : ["jpg", "png", "gif", "bmp"].includes(match[1]) ? match[1] : null;
+      if (type) {
+        this.current.push(
+          new ImageRun({
+            ...imageRunOpts,
+            type: "jpg",
+            data: src,
+            transformation: {
+              ...(imageRunOpts?.transformation || {}),
+              width: boundedWidth,
+              height: boundedHeight,
+            },
+            altText: {
+              name: alt || "",
+              description: caption || "",
+              title: title || "",
+            },
+          }),
+        );
+      }
+    }
+    let alignment: AlignOptions;
     switch (align) {
-      case 'right':
+      case "right":
         alignment = AlignmentType.RIGHT;
         break;
-      case 'left':
+      case "left":
         alignment = AlignmentType.LEFT;
         break;
       default:
         alignment = AlignmentType.CENTER;
     }
     this.addParagraphOptions({
-      // TODO: fix
-      alignment: alignment as any,
+      alignment: alignment,
     });
   }
 
@@ -289,10 +329,11 @@ export class DocxSerializerState {
     node: Node,
     opts: {
       getCellOptions?: (cell: Node) => ITableCellOptions;
-      getRowOptions?: (row: Node) => Omit<ITableRowOptions, 'children'>;
-      tableOptions?: Omit<ITableOptions, 'rows'>;
+      getRowOptions?: (row: Node) => Omit<ITableRowOptions, "children">;
+      tableOptions?: Omit<ITableOptions, "rows">;
     } = {},
   ) {
+    const prevMaxImageWidth = this.maxImageWidth;
     const { getCellOptions, getRowOptions, tableOptions } = opts;
     const actualChildren = this.children;
     const rows: TableRow[] = [];
@@ -301,20 +342,38 @@ export class DocxSerializerState {
       // Check if all cells are headers in this row
       let tableHeader = true;
       row.content.forEach((cell) => {
-        if (cell.type.name !== 'table_header') {
+        if (cell.type.name !== "table_header") {
           tableHeader = false;
         }
       });
       // This scales images inside of tables
-      this.maxImageWidth = MAX_IMAGE_WIDTH / row.content.childCount;
+      this.maxImageWidth = prevMaxImageWidth / row.content.childCount;
       row.content.forEach((cell) => {
         this.children = [];
         this.renderContent(cell);
-        const tableCellOpts: Mutable<ITableCellOptions> = { children: this.children };
+        const tableCellOpts: Mutable<ITableCellOptions> = {
+          children: this.children,
+        };
         const colspan = cell.attrs.colspan ?? 1;
         const rowspan = cell.attrs.rowspan ?? 1;
+        const colwidth: number[] | undefined = cell.attrs.colwidth;
         if (colspan > 1) tableCellOpts.columnSpan = colspan;
         if (rowspan > 1) tableCellOpts.rowSpan = rowspan;
+        if (colwidth) {
+          const totalWidth = colwidth.reduce(
+            (accum, width) => accum + width,
+            0,
+          );
+          tableCellOpts.width = {
+            type: "dxa",
+            size: totalWidth * 20,
+          };
+        } else {
+          tableCellOpts.width = {
+            type: "pct",
+            size: 100 / row.childCount,
+          };
+        }
         cells.push(
           new TableCell({
             ...tableCellOpts,
@@ -322,13 +381,30 @@ export class DocxSerializerState {
           }),
         );
       });
-      rows.push(new TableRow({ ...(getRowOptions?.(row) || {}), children: cells, tableHeader }));
+      if (cells.length > 0) {
+        rows.push(
+          new TableRow({
+            ...(getRowOptions?.(row) || {}),
+            children: cells,
+            tableHeader,
+          }),
+        );
+      }
     });
-    this.maxImageWidth = MAX_IMAGE_WIDTH;
-    const table = new Table({ ...tableOptions, rows });
-    actualChildren.push(table);
-    // If there are multiple tables, this seperates them
-    actualChildren.push(new Paragraph(''));
+    this.maxImageWidth = prevMaxImageWidth;
+    if (rows.length > 0) {
+      const table = new Table({
+        width: {
+          size: 100,
+          type: "pct",
+        },
+        ...tableOptions,
+        rows,
+      });
+      actualChildren.push(table);
+      // If there are multiple tables, this seperates them
+      actualChildren.push(new Paragraph(""));
+    }
     this.children = actualChildren;
   }
 
@@ -354,9 +430,10 @@ export class DocxSerializerState {
     this.current.push(new FootnoteReferenceRun(this.$footnoteCounter));
   }
 
-  closeBlock(node: Node, props?: IParagraphOptions) {
+  closeBlock(_node: Node, props?: IParagraphOptions) {
     const paragraph = new Paragraph({
       children: this.current,
+      ...this.persistParagraphOpts,
       ...this.nextParentParagraphOpts,
       ...props,
     });
